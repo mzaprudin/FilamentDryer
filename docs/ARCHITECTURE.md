@@ -1,512 +1,312 @@
-# Архитектура прошивки сушилки для филамента
+# FilamentDryer architecture
 
-Версия: 0.1
+[Русская версия](ARCHITECTURE.RU.md) · [Project overview](../README.md) ·
+[Measurements](MEASUREMENTS.md)
 
-Платформа: Arduino framework для ESP32-WROOM-32D
+This describes firmware **0.2.2** for the ESP32-WROOM-32D. The chamber holds two
+spools; temperature and humidity control share the same state with the local
+screen and web panel. Wi-Fi availability does not select the drying mode.
 
-Дата: 2026-08-30
+## Hardware and readings
 
-## 1. Назначение и границы
+The pin definitions are in [BoardConfig.h](../include/config/BoardConfig.h).
 
-Прошивка управляет сушильной камерой для двух катушек филамента и предоставляет два
-интерфейса управления:
-
-- локальный экран с энкодером и кнопкой;
-- веб-интерфейс по Wi-Fi.
-
-Устройство измеряет температуру и влажность воздуха, температуру PTC-нагревателя и
-массу каждой катушки. Поддерживаются пресеты пластиков, ручной режим и режим
-постоянного поддержания условий.
-
-Главный принцип безопасности: отсутствие Wi-Fi или веб-сервера не должно приводить к
-неконтролируемому нагреву, а локальный контур должен продолжать работу автономно.
-При любой критической ошибке нагреватель
-отключается аппаратным ключом и программно, а вентилятор и заслонка переводятся в
-безопасное состояние.
-
-## 2. Аппаратная конфигурация
-
-### 2.1. Периферия
-
-- ESP32-WROOM-32D, 4 МБ Flash с OTA-разметкой (вариант 16 МБ оставляет больше места
-  под историю и веб-ресурсы);
-- AHT30 по I²C — температура и относительная влажность воздуха в камере;
-- I²C-дисплей SH1106 128x64;
-- энкодер A/B и кнопка;
-- два независимых 4-проводных тензодатчика, по одному на HX711;
-- два модуля HX711, каждый используется по каналу A с одинаковым усилением;
-- NTC в пазу PTC-нагревателя — контроль температуры самого нагревателя;
-- 24-вольтовый PTC-нагреватель через N-MOSFET;
-- два 24-вольтовых двухпроводных вентилятора параллельно через один N-MOSFET;
-- сервопривод заслонки от отдельного источника 5–6 В.
-
-Термопредохранитель на 120 °C остаётся независимой аппаратной защитой и включается
-последовательно с нагревателем. Он не заменяется программным контролем.
-
-### 2.2. Предлагаемая распиновка
-
-| Функция | GPIO ESP32 | Примечание |
+| Function | GPIO | Implementation |
 |---|---:|---|
-| I²C SDA | 21 | общая шина AHT30 и дисплея |
-| I²C SCL | 22 | общая шина AHT30 и дисплея |
-| Энкодер A | 32 | вход с подтяжкой |
-| Энкодер B | 33 | вход с подтяжкой |
-| Кнопка | 25 | вход с подтяжкой, программный debounce |
-| Нагреватель PWM/временное окно | 26 | выход на драйвер MOSFET |
-| Вентиляторы PWM | 27 | один ключ на оба вентилятора |
-| Сервопривод | 14 | LEDC 50 Гц |
-| NTC | 34 | ADC1, вход только |
-| HX711 №1 DOUT | 16 | цифровой вход |
-| HX711 №1 SCK | 17 | цифровой выход |
-| HX711 №2 DOUT | 18 | цифровой вход |
-| HX711 №2 SCK | 19 | цифровой выход |
-
-GPIO6–GPIO11 не используются: они заняты SPI Flash модуля. Выбранные GPIO не
-являются загрузочными strapping-пинами. Для окончательной платы необходимо проверить
-распиновку именно используемого DevKit/WROOM-модуля.
-
-### 2.3. Силовая часть
-
-- Для нагревателя и вентиляторов применяются логические N-MOSFET, полностью
-  открывающиеся при Vgs = 3,3 В.
-- Для управления нагревателем и вентиляторами рекомендуются транзисторы IRLZ34N.
-- На затвор каждого MOSFET ставятся последовательный резистор 47–220 Ом и
-  подтяжка 47–100 кОм к земле, чтобы нагрузки были выключены при сбросе ESP32.
-- Один ключ вентилятора должен выдерживать сумму рабочего и пускового токов двух
-  вентиляторов; рекомендуется отдельный предохранитель силовой ветви.
-- PTC-нагреватель является резистивной нагрузкой, защитный диод параллельно ему не
-  требуется. Блок питания и MOSFET выбираются по холодному пусковому току PTC, а не
-  только по номинальной мощности.
-- Сервопривод питается не от GPIO и не от 3,3 В ESP32. Земля сервопривода,
-  HX711 и ESP32 общая, но токи вентиляторов не должны проходить через аналоговую
-  землю HX711.
-- Для вентиляторов предусматриваются TVS/диодная защита по рекомендации их
-  производителя и локальные конденсаторы 100 нФ + 100–470 мкФ.
-
-### 2.4. Аналоговая часть
-
-NTC подключается делителем:
-
-~~~text
-3.3 В ── Rфиксированный ── ADC GPIO34 ── NTC ── GND
-~~~
-
-Расчёт ниже выполнен для типового NTC с номиналом 10 кОм при 25 °C и
-Beta = 3950 K. Сопротивление термистора рассчитывается по формуле:
-
-~~~text
-R(T) = R25 · exp(B · (1/(T + 273.15) − 1/298.15))
-~~~
-
-где T — температура в °C, R25 = 10 000 Ом, B = 3950 K. Для диапазона 0–150 °C
-получаются следующие значения:
-
-| T, °C | R_NTC, Ом |
-|---:|---:|
-| 0 | 33 621 |
-| 25 | 10 000 |
-| 50 | 3 588 |
-| 75 | 1 492 |
-| 100 | 698 |
-| 125 | 359 |
-| 150 | 200 |
-
-При питании делителя от 3,3 В напряжение на ADC равно:
-
-~~~text
-V_ADC = 3.3 · R_NTC / (Rфиксированный + R_NTC)
-~~~
-
-Теоретический выбор резистора, обеспечивающий максимальный перепад напряжения
-между границами диапазона, определяется геометрическим средним сопротивлений NTC:
-
-~~~text
-Rфиксированный ≈ √(R_NTC(0 °C) · R_NTC(150 °C))
-                 ≈ √(33 621 · 200) ≈ 2,6 кОм
-~~~
-
-Однако у ESP32 края диапазона ADC нелинейны. При ослаблении 11 dB вход электрически
-не должен превышать 3,3 В, а практически измеряемый диапазон следует ограничивать
-примерно значениями 0,15–3,1 В и уточнять по версии Arduino-ESP32 и калибровке
-конкретного экземпляра. Сравнение стандартных номиналов:
-
-| T, °C | V_ADC, 2,7 кОм | V_ADC, 3,3 кОм | V_ADC, 3,9 кОм |
-|---:|---:|---:|---:|
-| 0 | 3,055 В | 3,005 В | 2,957 В |
-| 25 | 2,598 В | 2,481 В | 2,374 В |
-| 50 | 1,883 В | 1,719 В | 1,581 В |
-| 75 | 1,174 В | 1,027 В | 0,913 В |
-| 100 | 0,677 В | 0,576 В | 0,501 В |
-| 125 | 0,387 В | 0,324 В | 0,278 В |
-| 150 | 0,227 В | 0,188 В | 0,161 В |
-
-- 2,7 кОм близок к теоретическому оптимуму 2,6 кОм и даёт наибольший перепад,
-  но при 0 °C оставляет мало запаса до верхнего края измеряемого диапазона ADC.
-- 3,9 кОм увеличивает верхний запас, но при 150 °C оставляет всего около 11 мВ
-  до условной нижней границы 0,15 В; с учётом допусков NTC сигнал может выйти за неё.
-- **3,3 кОм, 1% рекомендуется как компромисс** для прямого измерения 0–150 °C:
-  номинальный диапазон 0,188–3,005 В оставляет запас с обеих сторон и сохраняет
-  приемлемую чувствительность при высокой температуре.
-
-После измерения напряжения сопротивление и температура восстанавливаются так:
-
-~~~text
-R_NTC = Rфиксированный · V_ADC / (3.3 − V_ADC)
-T = 1 / (1/298.15 + ln(R_NTC/R25)/B) − 273.15
-~~~
-
-Для рекомендованного делителя 3,3 кОм ток составляет примерно 89 мкА при 0 °C и
-0,94 мА при 150 °C. Максимальная мощность фиксированного резистора составляет
-около 2,9 мВт (при 150 °C), а максимальная мощность NTC — около 0,83 мВт
-(примерно при 53 °C), что значительно ниже 0,125 Вт. GPIO34
-относится к ADC1, поэтому он совместим с одновременной работой Wi‑Fi. В прошивке
-следует использовать `ADC_11db`, `analogReadMilliVolts()` с калибровкой и
-усреднение нескольких измерений. Между GPIO34 и GND устанавливается конденсатор
-100 нФ (допустимо 10–100 нФ).
-
-Номинал Rфиксированный и параметры NTC (R25, Beta, допуски) должны храниться в
-настройках и соответствовать фактически установленному датчику. Необходимо также
-проверять обрыв и короткое замыкание NTC; при неисправности нагреватель отключается.
-Сам NTC должен иметь паспортный рабочий предел не менее 150 °C, предпочтительно
-200 °C, с термостойким корпусом и проводами.
-
-AHT30 располагается в потоке воздуха камеры, но не вплотную к нагревателю и не в
-месте возможной конденсации. Температура в точке установки должна оставаться в
-допустимом диапазоне датчика.
-
-HX711 устанавливаются ближе к тензодатчикам; аналоговые провода скручиваются и
-прокладываются отдельно от 24-вольтовых проводов, PWM и сервопривода.
-
-## 3. Выбор одного или двух HX711
-
-Используются два отдельных HX711: каждый мост подключён к входу A своего модуля.
-Оба модуля работают с одинаковым усилением и имеют собственные DOUT и SCK.
-
-Один HX711 с каналами A и B допустим как упрощённый вариант: мосты подключаются к
-каналам A и B, а E+/E- общие. Однако канал B имеет усиление только 32 вместо 128,
-каналы читаются поочерёдно, а часть библиотек неудобно поддерживает переключение
-канала. Калибровка исправляет масштаб и ноль, но не исправляет худшее разрешение,
-шум и дрейф канала B. Поэтому этот вариант не является целевым.
-
-Для каждого датчика сохраняются отдельные tare и scale:
-
-~~~text
-weight1 = (raw1 - tare1) / scale1
-weight2 = (raw2 - tare2) / scale2
-total_weight = weight1 + weight2
-~~~
-
-Измерения выполняются в режиме HX711 10 SPS с программным фильтром. Для отображения
-веса рекомендуется медианный фильтр и/или скользящее среднее 8–16 значений.
-
-## 4. Логическая архитектура прошивки
-
-Прошивка делится на независимые сервисы. Каждый сервис работает неблокирующим
-образом и имеет собственный период обновления.
-
-~~~text
-SensorService       AHT30, NTC, HX711, фильтрация, диагностика
-ControlService      PID температуры/влажности, ограничения, режимы
-ActuatorService     MOSFET нагревателя, вентиляторы, сервопривод
-UiService           экран, энкодер, кнопка
-WebService          HTTP API, статические ресурсы, live-состояние
-StorageService      NVS-конфигурация, LittleFS-история и события
-NetworkService      STA/AP, mDNS, OTA
-SafetyService       аварийные условия, watchdog, безопасный запуск
-~~~
-
-Общее состояние устройства хранится в одной структуре DeviceState; веб, экран и
-контуры управления читают её через безопасный снимок. Веб-обработчики только
-проверяют команды и меняют заданные параметры, но не выполняют регулирование сами.
-
-## 5. Контуры регулирования
-
-### 5.1. Температура воздуха
-
-Основной регулируемый параметр — температура воздуха по AHT30. PID управляет
-мощностью PTC-нагревателя. Рекомендуемый период расчёта — 0,5–1 с, с ограничением
-скорости изменения уставки и anti-windup.
-
-NTC в пазу нагревателя не заменяет этот датчик. Он является быстрым ограничителем:
-
-- при превышении heater_max_temp мощность нагревателя немедленно устанавливается
-  в ноль;
-- повторное включение разрешается только после охлаждения ниже порога с гистерезисом;
-- при недостоверном NTC нагрев запрещается.
-
-Это позволяет отдельно контролировать температуру воздуха и не перегревать сам
-нагревательный элемент.
-
-### 5.2. Влажность воздуха
-
-Влажность измеряется AHT30. Контур влажности формирует медленный запрос на
-вентиляцию (ventilation_demand), который преобразуется в положение заслонки и
-скорость вентиляторов.
-
-Относительная влажность зависит от температуры: при одном только нагреве RH
-уменьшается, хотя количество воды в камере не изменилось. Поэтому для внутреннего
-регулятора из показаний AHT30 рассчитывается абсолютная влажность/влагосодержание.
-Уставка RH пользователя трактуется как RH при целевой температуре воздуха, а
-ошибка PID вычисляется по этому скорректированному показателю. Во время прогрева
-контур влажности ограничивается или временно приостанавливается, чтобы не создавать
-лишнюю вентиляцию.
-
-У сушилки нет отдельного осушителя, поэтому влажность можно только уменьшать
-удалением воздуха. Целевая влажность является ограничением/ориентиром: если наружный
-воздух влажнее заданного, достижение уставки невозможно и интерфейс должен показать
-состояние target_unreachable.
-
-Для влажности используется PID с фильтрованной производной; на практике начальная
-настройка может иметь Kd = 0 (PI-режим). Период расчёта — 5–10 с, чтобы не реагировать
-на шум AHT30.
-
-Приоритеты исполнительных механизмов:
-
-1. аварийное охлаждение и защита NTC;
-2. удержание температуры воздуха;
-3. удаление влаги;
-4. минимизация шума и энергопотребления.
-
-Если вентиляция охлаждает камеру, температурный PID временно увеличивает нагрев, но
-нагрев ограничивается heater_max_temp и максимальной мощностью.
-
-### 5.3. Оптимизация шума и энергии
-
-- Нагреватель управляется временными окнами 0,5–2 с. Быстрый PWM разрешён как
-  отдельная опция, но для PTC обычно не нужен.
-- Вентиляторы имеют минимальное рабочее заполнение и краткий импульс 100 % при
-  запуске, чтобы гарантировать раскрутку.
-- Заслонка имеет deadband 2° по умолчанию: новое положение передаётся сервоприводу
-  только при отклонении не менее этого порога от последнего фактически заданного
-  угла. Крайние положения (полностью закрыто/открыто) задаются принудительно.
-- После перемещения управляющие импульсы сервопривода отключаются примерно через
-  500 мс. Заслонка не требует постоянного момента удержания; это уменьшает дребезг,
-  акустический шум и потребление. При следующей существенной команде серво временно
-  подключается снова.
-- Вводятся минимальные времена включения/выключения вентилятора и заслонки.
-- В обычном режиме используется минимальный достаточный поток; краткий purge-цикл
-  выполняется только при росте влажности или на завершающей стадии.
-- После отключения нагревателя вентилятор может работать заданное время для
-  охлаждения и выравнивания температуры.
-
-## 6. Режимы работы
-
-Состояния автомата:
-
-~~~text
-IDLE → PRECHECK → WARMUP → DRYING → FINISH → IDLE
-                         └──────→ FAULT
-~~~
-
-### Пользовательские режимы
-
-1. **Пресет пластика с таймером** — тип пластика, температура, допустимая влажность
-   и длительность берутся из редактируемого пресета.
-2. **Ручной режим с таймером** — пользователь задаёт температуру, влажность,
-   длительность, предел нагревателя и параметры вентиляции.
-3. **Постоянное поддержание** — таймер отсутствует, условия поддерживаются до команды
-   остановки.
-4. **Охлаждение/продувка** — нагрев запрещён, вентилятор и заслонка работают по
-   заданному сценарию.
-5. **Калибровка и сервис** — NTC, два HX711, положение заслонки, тест выходов.
-
-Пресеты являются рекомендациями, а не универсальными значениями: температура и
-время должны оставаться редактируемыми под конкретную марку филамента. Начальный
-набор: PLA, PETG, ABS/ASA, PA/нейлон, TPU, PC и пользовательские пресеты.
-
-Во время работы таймер отсчитывается при валидных датчиках, необходимых для
-управления камерой, и отсутствии аварии. Показания веса являются дополнительной
-телеметрией: отсутствие одного или обоих HX711 не останавливает сушку. После
-завершения выполняется fan-run-on и запись события.
-
-Каждый пресет содержит как минимум:
-
-~~~text
-id, name, air_temperature_setpoint, relative_humidity_setpoint,
-duration, heater_max_temperature, minimum_fan, ventilation_profile
-~~~
-
-Профиль вентиляции задаёт минимальный поток, условия открытия заслонки и
-периодические purge-циклы. Все поля пресета редактируемы через веб-интерфейс и
-защищены проверкой допустимых диапазонов.
-
-## 7. Локальный интерфейс
-
-Экран показывает компактную сводку:
-
-- режим и оставшееся время;
-- температура/влажность воздуха;
-- температура NTC нагревателя;
-- вес катушки 1, катушки 2 и сумма;
-- мощность нагревателя, скорость вентиляторов, угол заслонки;
-- предупреждения и состояние Wi-Fi.
-
-Энкодер используется для навигации и изменения значений:
-
-- вращение — выбор пункта/изменение значения;
-- короткое нажатие — вход/подтверждение;
-- долгое нажатие — назад или остановка с подтверждением.
-
-События энкодера обрабатываются с debounce 5–20 мс. Критические команды (запуск,
-остановка, сброс аварии) требуют подтверждения.
-
-## 8. Веб-интерфейс и API
-
-Веб-приложение хранится локально во Flash и имеет единый набор данных с экраном.
-Рекомендуемый вид — адаптивная одностраничная панель:
-
-- карточки текущих T/RH, NTC и веса обеих катушек;
-- выбор пресета или ручной уставки;
-- старт/пауза/остановка и постоянный режим;
-- графики температуры, влажности, веса и выходов;
-- журнал событий и изменений настроек;
-- страница калибровки, сети и обновления.
-
-Минимальный REST API:
-
-~~~text
-GET  /api/state              текущее состояние
-GET  /api/config             настройки и пресеты
-PUT  /api/config             изменение настроек
-POST /api/run                запуск/пауза/остановка режима
-GET  /api/history            телеметрия за интервал
-GET  /api/events             журнал событий и изменений
-POST /api/calibration        операции калибровки
-POST /api/ota                обновление приложения/файлов
-~~~
-
-Для обновления показаний достаточно JSON-запроса раз в 0,5–1 с. WebSocket или SSE
-можно добавить позднее, если потребуется более плавный график. Веб-обработчики не
-должны содержать блокирующих операций.
-
-## 9. Хранение и история
-
-- Preferences/NVS: Wi-Fi-параметры, активный режим, уставки, PID-коэффициенты,
-  калибровки HX711 и NTC, положение заслонки, пользовательские пресеты.
-- LittleFS: HTML/CSS/JS, иконки, история телеметрии, журнал событий.
-- Телеметрия записывается агрегированно, например один раз в 1–5 минут; каждый
-  отсчёт HX711 во Flash не записывается.
-- Отсчёты помечены `millis()` с момента загрузки; после синхронизации NTP
-  (вкл/выкл, сдвиг часового пояса от UTC и сервер задаются в веб-панели)
-  записи дополнительно получают метку `epoch` (Unix-время), по которой
-  веб-график показывает календарные метки.
-- История хранится кольцевым буфером с ограничением размера. События (запуск,
-  остановка, изменение уставки, авария, OTA) сохраняются отдельно и не теряются при
-  перезаписи телеметрии.
-
-Для 4 МБ Flash используется OTA-разметка с двумя слотами приложения и компактной
-LittleFS. Этого достаточно для лёгкого интерфейса и ограниченной истории. Модуль с
-16 МБ предпочтителен, если нужны длительные графики, большие ресурсы или несколько
-версий журналов, но функционально не обязателен.
-
-## 10. Wi-Fi, доменное имя и OTA
-
-- Основной режим — Wi-Fi Station в домашней сети.
-- Точка доступа для настройки никогда не поднимается автоматически — ни при
-  отсутствии сохранённой сети, ни при потере связи с роутером. Устройство без
-  сети продолжает работать автономно, а посторонний не может «дождаться»
-  открытую точку.
-- Точка настройки включается вручную из меню устройства (`WIFI SETUP`) или
-  удержанием кнопки энкодера при подаче питания (headless-fallback на случай
-  неработающего экрана/энкодера; пароль при этом печатается в serial).
-- Точка защищена WPA2 со случайным паролем, генерируемым при каждой загрузке;
-  пароль и SSID показываются на экране. Окно работы точки ограничено
-  (10 минут, перезапускается повторным запросом), чтобы конфигурационный
-  режим не оставался открытым бесконечно.
-- Provisioning выполняется неблокирующе: сетевой сервис обслуживается
-  короткими вызовами из основного цикла и не задерживает локальное управление.
-- Если домашняя сеть недоступна, сушилка продолжает работать автономно. Пользователь
-  может выбирать пресеты, задавать ручной режим, запускать и останавливать сушку и
-  просматривать состояние через экран и энкодер без настройки Wi-Fi.
-- Отсутствие сохранённой сети, активная точка настройки, ошибка подключения и потеря
-  Wi-Fi являются состояниями сетевого сервиса, но не авариями сушилки. Они не меняют
-  режим сушки, уставки, состояние таймера и команды исполнительным механизмам.
-- PID-регуляторы, опрос датчиков, автомат режимов, безопасность, экран и энкодер не
-  зависят от готовности сетевого стека и продолжают выполняться с заданными периодами.
-- Сетевые операции не должны содержать неограниченных ожиданий подключения или
-  блокирующих циклов; веб-панель обслуживается короткими вызовами `handleClient()`
-  из основного цикла.
-- Работающая точка настройки не запрещает запуск и продолжение локального режима
-  сушки.
-- ESPmDNS публикует имя вида dryer.local.
-- Настоящее имя вроде dryer.home возможно только при наличии записи в локальном
-  DNS/роутере; прошивка может показывать текущий IP и hostname для ручной настройки.
-- OTA выполняется через ArduinoOTA с паролем и дополнительно может быть доступно
-  через защищённую страницу веб-интерфейса.
-- Перед применением OTA проверяются размер и целостность образа; после запуска
-  выполняется самотестирование датчиков и выходов. Для автоматического отката
-  используется A/B-разметка и подтверждение успешного запуска новой прошивки; при
-  ошибке новая версия не должна включать нагрев.
-
-Требование держать нагреватель выключенным во время начальной инициализации действует
-только до проверки датчиков и конфигурации и не продлевается на время настройки Wi-Fi.
-Принудительное безопасное выключение также выполняется при аварии и непосредственно
-перед обновлением прошивки. Само по себе отсутствие Wi-Fi или открытие портала
-настройки не является причиной выключения нагревателя. В веб-интерфейс нельзя выводить
-пароль Wi-Fi или разрешать OTA без аутентификации.
-
-## 11. Безопасность и аварийные состояния
-
-Состояние FAULT фиксируется при следующих условиях:
-
-- NTC в обрыве, коротком замыкании или выше предельной температуры;
-- AHT30 не отвечает или выдаёт невозможные значения;
-- перегрев воздуха или превышение времени прогрева без достижения уставки;
-- ошибка сохранения критических настроек;
-- watchdog, brownout или повторный аварийный перезапуск.
-
-При аварии:
-
-1. нагреватель выключается;
-2. заслонка открывается в безопасное положение;
-3. вентиляторы включаются на заданную скорость, если это безопасно для механики;
-4. событие записывается во Flash;
-5. повторный нагрев разрешается только после охлаждения и подтверждения пользователя.
-
-На старте все выходы должны быть выключены до успешной инициализации датчиков и
-проверки конфигурации. Аппаратный термопредохранитель остаётся последним уровнем
-защиты. Механика заслонки должна иметь заранее выбранное безопасное положение при
-потере питания сервопривода; программной команды открыть заслонку недостаточно как
-единственной защиты.
-
-## 12. Рекомендуемые библиотеки
-
-Базовый набор для Arduino-ESP32:
-
-- Adafruit AHTX0 или библиотека AHT30 — AHT30;
-- HX711_ADC — два HX711, неблокирующее чтение, tare и калибровка;
-- U8g2 — OLED/LCD по I²C;
-- ESP32Encoder — энкодер;
-- QuickPID — два контура PID с anti-windup;
-- ESP32Servo или встроенный LEDC — сервопривод;
-- ArduinoJson — API и конфигурация;
-- встроенные WiFi, WebServer, ArduinoOTA, ESPmDNS;
-- встроенные LittleFS и Preferences.
-
-Для первой версии предпочтителен встроенный WebServer: запросов от одного локального
-клиента немного, а зависимостей меньше. ESPAsyncWebServer + AsyncTCP можно добавить,
-если появятся несколько клиентов, WebSocket и более сложная панель.
-
-## 13. Критерии готовности первой версии
-
-1. При отключённом Wi-Fi камера продолжает безопасно поддерживать выбранный режим.
-2. При любой ошибке NTC нагреватель физически и программно отключается.
-3. Оба веса калибруются отдельно, сумма совпадает с эталоном в заданной погрешности.
-4. Температура воздуха удерживается PID без устойчивого перерегулирования.
-5. Влажность уменьшается вентиляцией, а недостижимая уставка явно отображается.
-6. Таймер, постоянный режим и пресеты доступны с экрана и из веб-интерфейса.
-7. История телеметрии и журнал изменений переживают перезапуск.
-8. OTA можно выполнить без физического доступа к плате, с безопасным откатом при
-   неуспешном запуске.
-
-## 14. Этапы реализации
-
-1. Проверка силовой части и безопасных уровней GPIO без нагревателя.
-2. Драйверы AHT30, NTC и двух HX711, калибровочные утилиты.
-3. Управление MOSFET и сервоприводом, аварийные блокировки.
-4. PID температуры, затем медленный контур влажности.
-5. Автомат режимов и пресеты.
-6. Экран и энкодер.
-7. Web API, веб-панель и история.
-8. Wi-Fi provisioning, mDNS и OTA.
-9. Испытания с тепловой нагрузкой, помехами, потерей сети и отказами датчиков.
+| I²C SDA / SCL | 21 / 22 | AHT30 at `0x38`, SH1106 at `0x3C`, 400 kHz |
+| Encoder A / B / button | 32 / 33 / 25 | local menu input |
+| Heater MOSFET | 26 | 24 V PTC, on/off under the thermostat |
+| Fan MOSFET | 27 | two 24 V fans, 20 kHz, 10-bit PWM |
+| Vent servo | 14 | separate 5–6 V supply, 50 Hz |
+| Heater NTC | 34 | ADC1, 10 kΩ at 25 °C, Beta 3950 |
+| HX711 #1 DOUT / SCK | 16 / 17 | spool one |
+| HX711 #2 DOUT / SCK | 18 / 19 | spool two |
+
+The hardware design includes a 120 °C thermal fuse in series with the heater.
+MOSFET gate pull-downs keep the power stages off while the ESP32 resets.
+
+The NTC divider is `3.3 V → fixed resistor → ADC → NTC → ground`. The driver
+uses a **3.6 kΩ** fixed resistor, `ADC_11db` and the ratio from `analogRead()`:
+
+```text
+r = raw / 4095
+R_NTC = 3600 × r / (1 − r)
+T_K = 1 / (1 / 298.15 + ln(R_NTC / 10000) / 3950)
+T_C = T_K − 273.15
+```
+
+Near-rail ADC values and temperatures outside the driver's accepted range produce
+an invalid reading. These constructor values come from
+[Defaults.h](../include/config/Defaults.h). AHT30 readings include temperature,
+relative humidity, absolute humidity and a validity flag. Each HX711 uses an
+eight-reading median before conversion to grams.
+
+## Services and scheduling
+
+`src/main.cpp` assembles drivers, services and one `DeviceState` object. Hardware
+drivers implement the interfaces in `include/domain/Interfaces.h`; the control
+core can therefore run in host tests with mock outputs.
+
+```mermaid
+flowchart TD
+    Sensors["SensorService: air, NTC, weights"] --> State["DeviceState"]
+    State --> Control["ControlService + DryingStateMachine"]
+    Safety["SafetyService"] --> Control
+    Control --> Actuators["ActuatorService"]
+    Actuators --> Outputs["Heater, fan, vent"]
+    Local["OLED + encoder"] --> Commands["Start / pause / stop"]
+    Web["REST API + web panel"] --> Commands
+    Commands --> Control
+    State --> Local
+    State --> Web
+    State --> Storage["NVS + LittleFS"]
+```
+
+The main loop schedules these nominal periods:
+
+| Work | Period |
+|---|---:|
+| NTC and weight polling | 100 ms |
+| Control, calibration, actuator application | 100 ms |
+| Air sensor polling | 1 s |
+| Local screen rendering | 250 ms |
+| AH samples inside an eligible window | 30 s |
+| LittleFS telemetry | 60 s |
+| Serial diagnostics | 5 s |
+
+Local input, Wi-Fi, ArduinoOTA and the HTTP server are serviced from the same
+loop. Their calls share the task with the controller. The task watchdog is
+configured for five seconds.
+
+## Temperature cascade
+
+The outer controller uses chamber air temperature as feedback and outputs a
+**heater-temperature setpoint**. The inner thermostat compares this setpoint with
+the heater NTC and requests either 0% or 100% heat.
+
+The active air target is the drying target, or `holdTemperatureC` in `Hold` when
+that value is positive. The normal heater ceiling is the lower positive preset
+and configuration limit minus 5 °C. `ControlService` also keeps this ceiling at
+least 1 °C above the air target so the PID has an output range.
+
+The project's `PidController` limits its output and integral, computes the
+derivative from the input, and applies anti-windup. A changed temperature range
+resets the PID and thermostat. The thermostat has a ±1 °C band and a two-second
+minimum switching interval; the safety gate can turn heating off independently.
+
+## Pulse ventilation
+
+`PurgeScheduler` follows three phases. The numeric values also appear in
+`dryness.purgePhase` in the API.
+
+| Phase | Value | Vent | Fan demand |
+|---|---:|---|---|
+| `Sealed` | 0 | closed | circulation duty |
+| `Purge` | 2 | open | purge duty |
+| `Settle` | 1 | open | purge duty |
+
+After the minimum sealed interval, ventilation starts when AH has risen by at
+least **0.5 g/m³** from its sealed baseline, or has reached
+`AH(active air target, target RH) + 3 g/m³`. The first purge may start immediately
+to exchange the initial air.
+
+`Purge` ends when AH is below that latter threshold or the purge duration cap
+expires. `Settle` keeps the vent open for its configured duration, then closes it
+and captures a new AH baseline. Comments in the original design described a
+closed settling phase; the current output policy keeps it open.
+
+Active fan duty is at least the larger of the configured floor and 25%.
+Ventilation scheduling continues independently of the AH measurement-window
+deadline.
+
+## Moisture-release measurement
+
+Absolute humidity (AH) expresses water vapour in g/m³. In a closed chamber near a
+steady temperature, its rate of change provides an estimate of moisture released
+by the filament. `HumidityMath` converts the AHT30 temperature and relative
+humidity using saturation vapour pressure and the ideal-gas relation.
+
+`AhSlopeEstimator` fits a line to AH versus time and reports its slope in
+g/m³/hour. It stores up to 40 samples and uses times relative to the newest
+sample when computing the regression.
+
+An eligible window needs `Drying` or `Hold`, a closed vent, and chamber air
+within ±1 °C of its active target. Its first sample is taken immediately; later
+samples arrive every 30 seconds. A slope needs at least eight samples, spanning
+at least 210 seconds.
+
+```text
+window duration = max(minSealSeconds × 1000, 7 × 30000) milliseconds
+quiet window    = valid slope < drynessSlopeGm3PerHour
+wet window      = valid slope ≥ drynessSlopeGm3PerHour
+```
+
+The time deadline completes an eligible window without opening the vent. A real
+`Sealed → Purge` transition can also complete a window with enough samples.
+Coincident events produce one evaluation. A quiet evaluation increments
+`drynessChecks`; a wet evaluation clears it. Incomplete windows produce neither
+result. Ventilation itself does not erase completed evidence.
+
+Leaving the temperature band, opening the vent or pausing discards the unfinished
+window. A fresh run and a change between `Drying` and `Hold` reset the measurements
+and consecutive-window count. This keeps warm-up and cooling samples out of the
+next temperature regime.
+
+The initial preset threshold is **0.3 g/m³/hour**. It and the timing values are
+starting values for the [measurement procedure](MEASUREMENTS.md). Weight readings
+are independent telemetry and are not required for this criterion.
+
+## Modes and transitions
+
+The core transitions are implemented in
+[DryingStateMachine.cpp](../src/core/DryingStateMachine.cpp).
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Idle
+    Idle --> Precheck: start
+    Precheck --> Warmup
+    Warmup --> Drying: target −1 °C
+    Drying --> Hold: dry / time limit
+    Hold --> Drying: new moisture
+    Drying --> Finish: manual timer
+    Finish --> Idle: 30 seconds
+```
+
+- **Preset:** at least the minimum drying time and two consecutive quiet windows
+  permit `Hold`. The maximum time also selects `Hold`. Time is counted from the
+  end of warm-up, excluding pauses.
+- **Hold:** the air target drops to the preset storage temperature. A new quiet
+  window arms moisture detection; a later wet window requests a fresh drying
+  episode. A zero old counter cannot restart the cycle by itself. A zero dryness
+  threshold disables both early completion and automatic re-drying.
+- **Manual:** the countdown ends in `Finish`, regardless of the dryness counter.
+- **Continuous:** conditions are maintained until a stop command.
+- **Pause:** saves `Warmup`, `Drying` or `Hold` for resume; the incomplete
+  measurement window is discarded.
+- **Stop:** selects `Cooldown` and then `Idle` after 30 seconds. A new explicit
+  start selects `Precheck` and clears the previous fault.
+
+`Calibration` is an internal mode used by the weight-calibration service.
+Material presets and their minimum/maximum durations are compiled in
+[AppConfig.cpp](../src/config/AppConfig.cpp). `GET /api/config` lists them;
+changing the compiled preset table requires a firmware build.
+
+## Output policy and safety
+
+`SafetyService` checks valid, finite air and heater readings, the heater limit and
+the air ceiling. Missing load cells do not block heating. Default ceilings are
+105 °C for the heater and 75 °C for the air.
+
+`ActuatorService` applies fan output before heater output and raises requested
+fan duty to its startup-configured floor whenever heat is requested. This is a
+software invariant about commands; the hardware has no airflow feedback.
+
+| Situation | Heater | Fan | Vent |
+|---|---:|---:|---|
+| `Idle`, `Paused`, established `Fault` | off | off | safe angle |
+| `Finish`, `Cooldown` | off | 60% | safe angle |
+| Safety check detects a fault | off | 100% for that update | safe angle |
+| Controller observes OTA in progress | off | 60% | safe angle |
+
+On the update following fault detection, the established `Fault` output policy
+applies. The independent thermal fuse and gate pull-downs belong to the hardware
+design. Fault enums also contain planned cases; the current safety evaluator
+does not implement warm-up timeouts or convert storage failures into faults.
+
+## Web API and persistent data
+
+Both interfaces work on the same state machine. API handlers delegate commands
+to services; they do not run a separate control algorithm.
+
+| Method and path | Behavior |
+|---|---|
+| `GET /api/state` | full live state, version, readings, setpoints, outputs and dryness |
+| `GET /api/config` | exposed settings and compiled presets; passwords omitted |
+| `PUT /api/config` | exposed network, authentication, time, temperature, fan and scale settings |
+| `POST /api/run` | preset, manual or continuous start |
+| `POST /api/pause` | toggle pause/resume |
+| `POST /api/stop` | stop and cool down |
+| `GET /api/history` | current telemetry JSONL file |
+| `GET /api/events` | current event JSONL file |
+| `GET/POST /api/calibration` | scale status or tare/scale/drift action |
+| `GET /api/scan` | start or collect asynchronous Wi-Fi scan |
+| `POST /api/reboot` | reboot |
+| `POST /api/ota` | multipart firmware upload |
+
+Example run bodies are `{"mode":"timed_preset","preset":"pla"}` and
+`{"mode":"timed_manual","temperatureC":45,"durationSeconds":21600}`.
+Configuration updates are saved and return `rebootRequired`; a restart completes
+application of startup-configured settings. Preset dryness thresholds and timing
+are not writable through this endpoint.
+
+Preferences/NVS stores individual configuration keys and the two weight
+compensation tables. Runtime mode, pending moisture events and measurement
+windows are held in RAM. The storage service migrates the original binary
+configuration blob to the key-value layout.
+
+LittleFS contains the web assets, `/telemetry.jsonl` and `/events.jsonl`.
+Each log rotates at 300,000 bytes to one `.old` file. History and event endpoints
+return the current files in full. Telemetry is written every 60 seconds and
+includes `ts`, optional `epoch`, `t`, `rh`, `ah`, `ntc`, `w1`, `w2`, `heat`,
+`fan`, `vent`, `pph` and `slope`. Full state capture is used for experiments
+because it also contains the drying phase, slope sample count and quiet-window
+counter.
+
+## Network, first setup and OTA
+
+With no saved network, Wi-Fi stays off; with saved credentials, the station
+connects and retries independently of the drying mode. `WIFI SETUP → Start` or a
+held encoder button at boot opens `dryer-setup-XXXX`. Its per-boot random WPA2
+password is shown on the screen and serial console. Setup runs for ten minutes;
+another request renews the window. The setup page is at `http://192.168.4.1`.
+
+On the home network the default address is `http://dryer.local`. NTP adds Unix
+timestamps when synchronized; the default display offset is UTC+3. An empty web
+password leaves the local panel and OTA open. A configured password enables HTTP
+Basic authentication, with `admin` as the fallback login, and also protects
+ArduinoOTA.
+
+Development uses PlatformIO Core 6.2.0. In a Python 3.11+ virtual environment,
+`python -m pip install -r requirements-dev.txt` installs the pinned build and
+plotting tools. Initial installation uploads both firmware and web assets:
+
+```sh
+pio run -e esp32dev -t upload
+pio run -e esp32dev -t uploadfs
+```
+
+Later firmware updates use the panel or ArduinoOTA:
+
+```sh
+pio run -e esp32dev_ota -t upload
+pio run -e esp32dev_ota -t upload --upload-port 192.168.1.238
+```
+
+For password-protected ArduinoOTA, the local PlatformIO configuration supplies
+the uploader's `--auth` argument through `upload_flags`. The web panel accepts
+`firmware.bin` through a multipart upload. ArduinoOTA transfers are blocking: its callbacks temporarily
+remove the main task from the watchdog and restore it after completion or error.
+The OTA flag suppresses LittleFS telemetry writes while a transfer is active.
+
+The [4 MB partition table](../partitions_ota_4mb.csv) provides two application
+slots and LittleFS. Automatic boot confirmation and rollback were part of the
+initial design; the current firmware uses the Arduino OTA mechanisms above.
+
+## Verification and design history
+
+Host tests in [test_logic.cpp](../test/test_native/test_logic.cpp) exercise
+humidity conversion/regression, temperature bounds, thermostat switching, fan
+command ordering, ventilation timing and state transitions. Python tests check
+capture against a local HTTP server and plotting with synthetic fixtures. CI
+also builds both production firmware profiles and the LittleFS image. The
+`esp32dev_test` profile disables NTC checks for bench work and is excluded from
+production artifacts.
+
+The initial architecture proposed direct heater-power PID, an RH PID,
+QuickPID/HX711_ADC and a timer-only completion path. The implementation uses a
+local PID plus heater thermostat, pulse ventilation, bogde/HX711 and AH-based
+completion with storage monitoring. Version 0.2.2 separates measurement-window
+completion from purges and makes re-drying depend on fresh measurements in
+`Hold`.

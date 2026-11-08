@@ -1,6 +1,7 @@
 #include "services/ControlService.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "config/Defaults.h"
 #include "control/HumidityMath.h"
@@ -20,17 +21,89 @@ void ControlService::restartPulseCycle(DeviceState& state, uint32_t now) {
   params.maxPurgeMs = state.setpoints.ventilation.maxPurgeSeconds * 1000UL;
   params.riseTriggerGm3 = defaults::kPurgeRiseTriggerGm3;
   purge_.begin(params, now);
+  resetDrynessTracking(state);
+}
+
+void ControlService::resetAhWindow(DeviceState& state) {
   ahSlope_.reset();
+  ahWindowActive_ = false;
   lastAhSampleAt_ = 0;
-  lastPurgePhase_ = PurgePhase::Sealed;
-  lastWindowSlopeValid_ = false;
-  stableWindows_ = 0;
   state.ahSlopeGm3PerHour = 0.0f;
   state.ahSlopeSamples = 0;
+}
+
+void ControlService::resetDrynessTracking(DeviceState& state) {
+  resetAhWindow(state);
+  stableWindows_ = 0;
   state.drynessChecks = 0;
+  holdRewetArmed_ = false;
+  state.rewetDetected = false;
+}
+
+void ControlService::evaluateAhWindow(DeviceState& state) {
+  const float threshold = state.setpoints.drynessSlopeGm3PerHour;
+  if (threshold <= 0.0f) {
+    stableWindows_ = 0;
+    holdRewetArmed_ = false;
+    state.rewetDetected = false;
+  } else if (state.ahSlopeGm3PerHour < threshold) {
+    if (stableWindows_ < 255) ++stableWindows_;
+    if (state.phase == DryingPhase::Hold) holdRewetArmed_ = true;
+  } else {
+    stableWindows_ = 0;
+    if (state.phase == DryingPhase::Hold && holdRewetArmed_) {
+      state.rewetDetected = true;
+      holdRewetArmed_ = false;
+    }
+  }
+  state.drynessChecks = stableWindows_;
+}
+
+void ControlService::updateAhWindow(DeviceState& state, uint32_t now,
+                                    bool closing) {
+  if (!ahWindowActive_) {
+    ahWindowActive_ = true;
+    ahWindowStartedAt_ = now;
+    ahSlope_.addSample(now, state.air.absoluteHumidityGm3);
+    lastAhSampleAt_ = now;
+  } else if (static_cast<uint32_t>(now - lastAhSampleAt_) >=
+             defaults::kAhSamplePeriodMs) {
+    ahSlope_.addSample(now, state.air.absoluteHumidityGm3);
+    lastAhSampleAt_ = now;
+  }
+  state.ahSlopeGm3PerHour = ahSlope_.slopeGm3PerHour();
+  state.ahSlopeSamples = ahSlope_.sampleCount();
+  const uint32_t minimumSpanMs =
+      (defaults::kAhSlopeMinSamples - 1UL) * defaults::kAhSamplePeriodMs;
+  const uint32_t windowMs = std::max<uint32_t>(
+      state.setpoints.ventilation.minSealSeconds * 1000UL, minimumSpanMs);
+  const bool elapsed =
+      static_cast<uint32_t>(now - ahWindowStartedAt_) >= windowMs;
+  if (ahSlope_.slopeValid() && (elapsed || closing)) {
+    // A timed completion and a simultaneous purge are one judgement. The
+    // next window shares only this boundary sample, never the whole slope.
+    evaluateAhWindow(state);
+    resetAhWindow(state);
+    if (!closing) {
+      ahWindowActive_ = true;
+      ahWindowStartedAt_ = now;
+      ahSlope_.addSample(now, state.air.absoluteHumidityGm3);
+      lastAhSampleAt_ = now;
+      state.ahSlopeSamples = ahSlope_.sampleCount();
+    }
+  }
+  if (closing) resetAhWindow(state);
 }
 
 void ControlService::update(DeviceState& state, uint32_t now) {
+  const bool resetRequested = state.measurementResetPending;
+  state.measurementResetPending = false;
+  // Clear old verdicts before the state machine can act on them, even when
+  // pause/resume restored the same phase between consecutive control ticks.
+  if (resetRequested) resetDrynessTracking(state);
+  // A fresh start can replace another active run, so capture Precheck before
+  // the state machine consumes it and advances to Warmup.
+  const bool starting = state.phase == DryingPhase::Precheck;
   stateMachine_.update(state, now);
   // Track phase transitions up front: a run (or resume) must restart the
   // pulse-ventilation cycle, since pauses park the vent at the safe angle.
@@ -44,10 +117,14 @@ void ControlService::update(DeviceState& state, uint32_t now) {
                          lastPhase_ == DryingPhase::Warmup ||
                          lastPhase_ == DryingPhase::Drying ||
                          lastPhase_ == DryingPhase::Hold;
-  if (active && !wasActive) restartPulseCycle(state, now);
+  if (starting || (active && (resetRequested || !wasActive))) {
+    restartPulseCycle(state, now);
+  }
+  if (state.phase != lastPhase_) resetDrynessTracking(state);
   lastPhase_ = state.phase;
 
   if (state.otaInProgress) {
+    resetDrynessTracking(state);
     state.actuators.heaterPower = 0.0f;
     state.actuators.fanPower = 60;
     state.actuators.ventAngle = config_.safeVentAngle;
@@ -71,6 +148,7 @@ void ControlService::update(DeviceState& state, uint32_t now) {
 
   FaultCode fault = FaultCode::None;
   if (!safety_.evaluate(state, now, fault)) {
+    resetDrynessTracking(state);
     stateMachine_.fault(state, fault, now);
     state.actuators.heaterPower = 0.0f;
     state.actuators.fanPower = 100;
@@ -92,6 +170,7 @@ void ControlService::update(DeviceState& state, uint32_t now) {
   const float ceiling =
       std::max(airTarget + 1.0f, heaterSetpointCeilingC(state.setpoints.heaterLimitC,
                                                          config_.heaterMaxTemperatureC));
+  if (airTarget != cascadeFloor_) resetDrynessTracking(state);
   if (airTarget != cascadeFloor_ || ceiling != cascadeCeiling_) {
     temperaturePid_.setTunings({config_.temperaturePid.kp, config_.temperaturePid.ki,
                                 config_.temperaturePid.kd, airTarget, ceiling});
@@ -116,39 +195,26 @@ void ControlService::update(DeviceState& state, uint32_t now) {
   const float absoluteTarget =
       relativeToAbsoluteHumidity(airTarget, state.setpoints.relativeHumidity);
   const float purgeFloor = absoluteTarget + defaults::kPurgeFloorMarginGm3;
+  const PurgePhase previousPurgePhase = purge_.phase();
   const PurgePhase phase =
       purge_.update(state.air.absoluteHumidityGm3, purgeFloor, now);
   state.purgePhase = static_cast<uint8_t>(phase);
 
-  // A sealed window that just closed is judged: a slope below the preset
-  // threshold earns one dryness check; anything wetter resets the streak.
-  if (lastPurgePhase_ == PurgePhase::Sealed && phase == PurgePhase::Purge) {
-    const float threshold = state.setpoints.drynessSlopeGm3PerHour;
-    if (threshold > 0.0f && lastWindowSlopeValid_ &&
-        lastWindowSlope_ < threshold) {
-      if (stableWindows_ < 255) ++stableWindows_;
-    } else {
-      stableWindows_ = 0;
-    }
-    state.drynessChecks = stableWindows_;
-  }
-  lastPurgePhase_ = phase;
-
-  if (phase == PurgePhase::Sealed) {
-    if (static_cast<uint32_t>(now - lastAhSampleAt_) >=
-        defaults::kAhSamplePeriodMs) {
-      lastAhSampleAt_ = now;
-      ahSlope_.addSample(now, state.air.absoluteHumidityGm3);
-      state.ahSlopeGm3PerHour = ahSlope_.slopeGm3PerHour();
-      state.ahSlopeSamples = ahSlope_.sampleCount();
-      lastWindowSlope_ = state.ahSlopeGm3PerHour;
-      lastWindowSlopeValid_ = ahSlope_.slopeValid();
-    }
+  const bool closing = previousPurgePhase == PurgePhase::Sealed &&
+                       phase == PurgePhase::Purge;
+  const bool measuringPhase = state.phase == DryingPhase::Drying ||
+                              state.phase == DryingPhase::Hold;
+  // Cooling from Drying to Hold must not arm re-wetting detection. Interrupt
+  // the window whenever the air leaves the existing +/-1 C warmup band.
+  const bool temperatureReady =
+      std::fabs(state.air.temperatureC - airTarget) <= 1.0f;
+  if (measuringPhase && temperatureReady &&
+      std::isfinite(state.air.absoluteHumidityGm3) &&
+      (phase == PurgePhase::Sealed || closing)) {
+    updateAhWindow(state, now, closing);
   } else {
-    // Purging or settling invalidates the sealed measurement window.
-    ahSlope_.reset();
-    state.ahSlopeGm3PerHour = 0.0f;
-    state.ahSlopeSamples = 0;
+    // An interrupted or insufficient window produces no dry/wet verdict.
+    resetAhWindow(state);
   }
 
   const bool ventOpen = phase != PurgePhase::Sealed;

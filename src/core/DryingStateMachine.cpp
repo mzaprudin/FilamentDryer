@@ -11,6 +11,9 @@ void DryingStateMachine::begin(DeviceState& state, uint32_t now) {
   state.phaseStartedAt = now;
   state.runStartedAt = 0;
   state.remainingSeconds = 0;
+  state.drynessChecks = 0;
+  state.rewetDetected = false;
+  state.measurementResetPending = true;
   state.runLabel[0] = '\0';
   durationSeconds_ = 0;
   pausedAt_ = 0;
@@ -33,6 +36,8 @@ bool DryingStateMachine::start(DeviceState& state, DryingMode mode,
   state.phaseStartedAt = now;
   state.runStartedAt = 0;
   state.drynessChecks = 0;
+  state.rewetDetected = false;
+  state.measurementResetPending = true;
   // Continuous and calibration modes have no countdown; the UI shows elapsed
   // time instead. Preset runs count down to their safety ceiling.
   if (mode == DryingMode::Continuous || mode == DryingMode::Calibration) {
@@ -57,6 +62,8 @@ void DryingStateMachine::pause(DeviceState& state, uint32_t now) {
       state.phase == DryingPhase::Hold) {
     pausedFrom_ = state.phase;
     state.phase = DryingPhase::Paused;
+    state.rewetDetected = false;
+    state.measurementResetPending = true;
     pausedAt_ = now;
   }
 }
@@ -67,6 +74,8 @@ void DryingStateMachine::resume(DeviceState& state, uint32_t now) {
       state.runStartedAt += static_cast<uint32_t>(now - pausedAt_);
     }
     state.phase = pausedFrom_;
+    state.rewetDetected = false;
+    state.measurementResetPending = true;
     state.phaseStartedAt = now;
     pausedAt_ = 0;
     pausedFrom_ = DryingPhase::Idle;
@@ -79,12 +88,16 @@ void DryingStateMachine::stop(DeviceState& state, uint32_t now) {
   state.fault = FaultCode::None;
   state.phaseStartedAt = now;
   state.remainingSeconds = 0;
+  state.rewetDetected = false;
+  state.measurementResetPending = true;
 }
 
 void DryingStateMachine::fault(DeviceState& state, FaultCode code, uint32_t now) {
   state.mode = DryingMode::Fault;
   state.phase = DryingPhase::Fault;
   state.fault = code;
+  state.rewetDetected = false;
+  state.measurementResetPending = true;
   state.phaseStartedAt = now;
 }
 
@@ -120,20 +133,24 @@ void DryingStateMachine::update(DeviceState& state, uint32_t now) {
                                      : maxDurationSeconds_ - elapsed;
       }
       const bool minElapsed = elapsed >= minDurationSeconds_;
-      const bool dry = state.drynessChecks >= defaults::kDrynessStableWindows;
+      const bool dry = state.setpoints.drynessSlopeGm3PerHour > 0.0f &&
+                       state.drynessChecks >= defaults::kDrynessStableWindows;
       const bool maxElapsed =
           maxDurationSeconds_ > 0UL && elapsed >= maxDurationSeconds_;
       if (maxElapsed || (minElapsed && dry)) {
         state.phase = DryingPhase::Hold;
         state.phaseStartedAt = now;
         state.remainingSeconds = 0;
+        state.rewetDetected = false;
       }
     }
   } else if (state.phase == DryingPhase::Hold) {
-    // Fresh moisture (lid opened, wet spool added) resets drynessChecks in
-    // the control loop; re-enter Drying with a fresh drying clock so the
-    // min/max budget applies to the new episode.
-    if (state.mode == DryingMode::TimedPreset && state.drynessChecks == 0) {
+    // Only a new confirmed moisture event may restart drying. In particular,
+    // reaching the time ceiling with a zero dry streak must remain in Hold.
+    const bool rewet = state.rewetDetected;
+    state.rewetDetected = false;
+    if (state.mode == DryingMode::TimedPreset &&
+        state.setpoints.drynessSlopeGm3PerHour > 0.0f && rewet) {
       state.phase = DryingPhase::Drying;
       state.phaseStartedAt = now;
       state.runStartedAt = now;

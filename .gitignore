@@ -1,1 +1,5 @@
 .pio
+__pycache__/
+.venv/
+reports/
+runs/

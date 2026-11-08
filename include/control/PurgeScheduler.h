@@ -8,13 +8,13 @@
 // air once enough moisture has collected. Sealed -> Purge -> Settle -> Sealed.
 enum class PurgePhase : uint8_t {
   Sealed = 0,  // vent closed, AH rising: measurement window
-  Settle = 1,  // vent just closed, fans mixing the air
+  Settle = 1,  // vent still open, fans mixing before the next sealed window
   Purge = 2    // vent open, fans at boost: exchanging chamber air
 };
 
 struct PurgeParams {
   uint32_t minSealMs = 600000;   // min sealed time before a purge may start
-  uint32_t settleMs = 180000;    // mixing time after the vent closes
+  uint32_t settleMs = 180000;    // mixing time with vent open after purging
   uint32_t maxPurgeMs = 45000;   // hard cap on vent-open time
   float riseTriggerGm3 = 0.5f;   // AH rise since seal start justifying a purge
 };
