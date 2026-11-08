@@ -1,4 +1,4 @@
-# iDryerMod
+# FilamentDryer
 
 [English version](README.md)
 
