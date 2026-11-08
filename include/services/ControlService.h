@@ -18,6 +18,10 @@ class ControlService {
 
  private:
   void restartPulseCycle(DeviceState& state, uint32_t now);
+  void resetAhWindow(DeviceState& state);
+  void resetDrynessTracking(DeviceState& state);
+  void updateAhWindow(DeviceState& state, uint32_t now, bool closing);
+  void evaluateAhWindow(DeviceState& state);
 
   const AppConfig& config_;
   SafetyService& safety_;
@@ -27,10 +31,10 @@ class ControlService {
   PurgeScheduler purge_;
   AhSlopeEstimator ahSlope_;
   DryingPhase lastPhase_ = DryingPhase::Idle;
-  PurgePhase lastPurgePhase_ = PurgePhase::Sealed;
-  float lastWindowSlope_ = 0.0f;
-  bool lastWindowSlopeValid_ = false;
   uint8_t stableWindows_ = 0;
+  bool holdRewetArmed_ = false;
+  bool ahWindowActive_ = false;
+  uint32_t ahWindowStartedAt_ = 0;
   uint32_t lastAhSampleAt_ = 0;
   float cascadeFloor_ = 0.0f;
   float cascadeCeiling_ = 0.0f;

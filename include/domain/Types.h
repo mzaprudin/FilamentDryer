@@ -128,7 +128,7 @@ struct VentilationPlan {
   uint16_t ventClosedAngle = 15;
   uint16_t ventOpenAngle = 90;
   uint32_t minSealSeconds = 600;    // min sealed time before a purge may start
-  uint32_t settleSeconds = 180;     // mixing time after the vent closes
+  uint32_t settleSeconds = 180;     // vent stays open; AH sampling remains paused
   uint32_t maxPurgeSeconds = 45;    // hard cap on vent-open time
 };
 
@@ -173,12 +173,18 @@ struct DeviceState {
   // Dryness telemetry: least-squares slope of absolute humidity over the
   // current sealed window (g/m^3 per hour) and its sample count, plus the
   // pulse-ventilation phase (0 sealed, 1 settle, 2 purge). drynessChecks
-  // counts consecutive sealed windows whose slope stayed below the preset
-  // threshold; reaching kDrynessStableWindows means the spool is dry.
+  // counts consecutive valid sealed windows whose slope stayed below the
+  // preset threshold. Windows also finish by time, without opening the vent.
   float ahSlopeGm3PerHour = 0.0f;
   uint8_t ahSlopeSamples = 0;
   uint8_t purgePhase = 0;
   uint8_t drynessChecks = 0;
+  // One-shot internal event: a quiet Hold window has been followed by a new
+  // wet window. Not persisted or serialized; a zero streak alone is no event.
+  bool rewetDetected = false;
+  // Commands can pause and resume between two control ticks. Latch that
+  // boundary so the next tick cannot reuse an old window or Hold baseline.
+  bool measurementResetPending = false;
   Setpoints setpoints;
   DryingMode mode = DryingMode::Idle;
   DryingPhase phase = DryingPhase::Idle;

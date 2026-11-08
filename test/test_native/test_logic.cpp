@@ -340,6 +340,11 @@ void test_state_machine_preset_dry_then_hold() {
   state.air.temperatureC = 64.0f;
   machine.update(state, 1000);
   TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying), static_cast<int>(state.phase));
+  // Quiet windows cannot shorten the preset's minimum active-drying time.
+  state.drynessChecks = 2;
+  machine.update(state, 5000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying), static_cast<int>(state.phase));
+  state.drynessChecks = 0;
   // Min time served but the spool still releases moisture: keep drying.
   machine.update(state, 12000);
   TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying), static_cast<int>(state.phase));
@@ -348,14 +353,22 @@ void test_state_machine_preset_dry_then_hold() {
   machine.update(state, 13000);
   TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold), static_cast<int>(state.phase));
   TEST_ASSERT_EQUAL_UINT32(0, state.remainingSeconds);
-  // Fresh moisture detected while holding: back to Drying with a fresh clock.
+  // Clearing the streak is not a new moisture event.
   state.drynessChecks = 0;
+  machine.update(state, 19000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold), static_cast<int>(state.phase));
+  // The control loop emits a confirmed re-wetting event after a quiet Hold
+  // window followed by a wet one: restart with a fresh drying clock.
+  state.rewetDetected = true;
   machine.update(state, 20000);
   TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying), static_cast<int>(state.phase));
   TEST_ASSERT_EQUAL_UINT32(60, state.remainingSeconds);
+  TEST_ASSERT_FALSE(state.rewetDetected);
   // Safety ceiling: settle into Hold even if never quiet.
   state.drynessChecks = 0;
   machine.update(state, 20000 + 61000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold), static_cast<int>(state.phase));
+  machine.update(state, 20000 + 62000);
   TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold), static_cast<int>(state.phase));
 }
 
@@ -427,7 +440,388 @@ void test_control_dryness_streak_from_sealed_windows() {
   TEST_ASSERT_EQUAL_UINT8(0, state.drynessChecks);
 }
 
-void runTests() {
+// Integration cases use measured AH directly so the temperature gate and the
+// measurement-window lifecycle can be exercised independently of sensor math.
+struct ControlFixture {
+  AppConfig config;
+  SafetyService safety{75.0f};
+  DryingStateMachine machine;
+  ControlService control{config, safety, machine};
+  DeviceState state;
+
+  ControlFixture() {
+    setDefaultConfig(config);
+    control.begin();
+    state.air.valid = true;
+    state.air.temperatureC = 45.0f;
+    state.air.relativeHumidity = 30.0f;
+    state.air.absoluteHumidityGm3 = 0.1f;
+    state.heater.valid = true;
+    state.heater.temperatureC = 45.0f;
+    state.setpoints.airTemperatureC = 45.0f;
+    state.setpoints.holdTemperatureC = 45.0f;
+    state.setpoints.relativeHumidity = 20.0f;
+    state.setpoints.heaterLimitC = 95.0f;
+    state.setpoints.drynessSlopeGm3PerHour = 0.3f;
+    state.setpoints.maxDurationSeconds = 7200;
+    machine.begin(state, 0);
+  }
+
+  void start() {
+    TEST_ASSERT_TRUE(machine.start(state, DryingMode::TimedPreset,
+                                   state.setpoints, 0));
+    control.update(state, 0);
+    control.update(state, 1000);
+  }
+
+  void flat(uint32_t first, uint32_t last) {
+    for (uint32_t now = first; now <= last; now += 30000UL) {
+      control.update(state, now);
+    }
+  }
+};
+
+void test_control_flat_ah_completes_without_extra_purges() {
+  ControlFixture fixture;
+  fixture.start();
+  fixture.flat(31000, 601000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.purgePhase);
+  TEST_ASSERT_EQUAL_UINT16(15, fixture.state.actuators.ventAngle);
+  fixture.flat(631000, 1201000);
+  fixture.control.update(fixture.state, 1201001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.purgePhase);
+  TEST_ASSERT_EQUAL_UINT16(15, fixture.state.actuators.ventAngle);
+}
+
+void test_control_short_plan_still_requires_eight_samples() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 30;
+  fixture.start();
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.ahSlopeSamples);
+  fixture.flat(31000, 181000);
+  TEST_ASSERT_EQUAL_UINT8(7, fixture.state.ahSlopeSamples);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.control.update(fixture.state, 211000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.purgePhase);
+}
+
+void test_control_warmup_does_not_count_dry_windows() {
+  ControlFixture fixture;
+  fixture.state.air.temperatureC = 35.0f;
+  fixture.start();
+  fixture.flat(31000, 601000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Warmup),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.state.air.temperatureC = 45.0f;
+  fixture.control.update(fixture.state, 602000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.ahSlopeSamples);
+}
+
+void test_control_temperature_gap_discards_partial_window() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 30;
+  fixture.start();
+  fixture.flat(31000, 181000);
+  fixture.state.air.temperatureC = 47.0f;
+  fixture.control.update(fixture.state, 190000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.state.air.temperatureC = 45.0f;
+  fixture.control.update(fixture.state, 191000);
+  fixture.flat(221000, 371000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.control.update(fixture.state, 401000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+}
+
+void test_control_resume_starts_fresh_measurement_window() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 30;
+  fixture.start();
+  fixture.flat(31000, 181000);
+  fixture.machine.pause(fixture.state, 190000);
+  fixture.control.update(fixture.state, 190000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  fixture.machine.resume(fixture.state, 191000);
+  fixture.control.update(fixture.state, 191000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.ahSlopeSamples);
+  fixture.flat(221000, 371000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.control.update(fixture.state, 401000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+}
+
+void test_control_new_run_during_drying_resets_windows() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 30;
+  fixture.start();
+  fixture.flat(31000, 211000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  TEST_ASSERT_TRUE(fixture.machine.start(fixture.state, DryingMode::TimedPreset,
+                                        fixture.state.setpoints, 212000));
+  fixture.control.update(fixture.state, 212000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  fixture.control.update(fixture.state, 213000);
+  fixture.flat(243000, 393000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.control.update(fixture.state, 423000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+}
+
+void test_control_initial_purge_and_settle_do_not_count_samples() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 30;
+  fixture.state.air.absoluteHumidityGm3 = 6.0f;
+  TEST_ASSERT_TRUE(fixture.machine.start(fixture.state, DryingMode::TimedPreset,
+                                        fixture.state.setpoints, 0));
+  fixture.control.update(fixture.state, 0);
+  TEST_ASSERT_EQUAL_UINT8(2, fixture.state.purgePhase);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  fixture.control.update(fixture.state, 1000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.purgePhase);
+  fixture.flat(31000, 151000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  fixture.control.update(fixture.state, 181000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.purgePhase);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.ahSlopeSamples);
+  fixture.flat(211000, 391000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+}
+
+void test_control_time_ceiling_keeps_hold_with_zero_streak() {
+  ControlFixture fixture;
+  fixture.state.setpoints.maxDurationSeconds = 10;
+  fixture.start();
+  fixture.control.update(fixture.state, 11000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  for (uint32_t now = 12000; now <= 72000; now += 1000) {
+    fixture.control.update(fixture.state, now);
+    TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                      static_cast<int>(fixture.state.phase));
+    TEST_ASSERT_EQUAL_UINT32(0, fixture.state.remainingSeconds);
+  }
+}
+
+void test_control_hold_requires_quiet_then_new_wet_window() {
+  ControlFixture fixture;
+  fixture.state.setpoints.maxDurationSeconds = 10;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.start();
+  fixture.control.update(fixture.state, 11000);
+  // The original wet spool remains in Hold at the time ceiling. It must
+  // first become quiet, rather than immediately starting another full run.
+  for (uint32_t now = 41000; now <= 431000; now += 30000) {
+    fixture.state.air.absoluteHumidityGm3 =
+        0.1f + 0.0001f * static_cast<float>(now - 11000) / 1000.0f;
+    fixture.control.update(fixture.state, now);
+    TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                      static_cast<int>(fixture.state.phase));
+  }
+  // One quiet complete window arms re-wetting detection.
+  fixture.flat(461000, 641000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  const float baseline = fixture.state.air.absoluteHumidityGm3;
+  for (uint32_t now = 671000; now <= 851000; now += 30000) {
+    fixture.state.air.absoluteHumidityGm3 =
+        baseline + 0.0001f * static_cast<float>(now - 641000) / 1000.0f;
+    fixture.control.update(fixture.state, now);
+  }
+  fixture.control.update(fixture.state, 851001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT32(851001, fixture.state.runStartedAt);
+  TEST_ASSERT_EQUAL_UINT32(10, fixture.state.remainingSeconds);
+  fixture.control.update(fixture.state, 852001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+}
+
+void test_control_zero_threshold_disables_dryness_and_redry() {
+  ControlFixture fixture;
+  fixture.state.setpoints.drynessSlopeGm3PerHour = 0.0f;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.state.setpoints.maxDurationSeconds = 900;
+  fixture.start();
+  fixture.flat(31000, 841000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.control.update(fixture.state, 901000);
+  fixture.flat(931000, 1321000);
+  for (uint32_t now = 1351000; now <= 1771000; now += 30000) {
+    fixture.state.air.absoluteHumidityGm3 += 0.003f;
+    fixture.control.update(fixture.state, now);
+    TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                      static_cast<int>(fixture.state.phase));
+  }
+}
+
+void test_control_hold_cooling_does_not_arm_rewetting() {
+  ControlFixture fixture;
+  fixture.state.setpoints.maxDurationSeconds = 10;
+  fixture.state.setpoints.holdTemperatureC = 40.0f;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.start();
+  fixture.control.update(fixture.state, 11000);
+  fixture.flat(41000, 431000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.state.air.temperatureC = 40.0f;
+  fixture.control.update(fixture.state, 432000);
+  // A wet first window at the Hold target cannot arm itself.
+  for (uint32_t now = 462000; now <= 642000; now += 30000) {
+    fixture.state.air.absoluteHumidityGm3 += 0.003f;
+    fixture.control.update(fixture.state, now);
+  }
+  fixture.control.update(fixture.state, 642001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+}
+
+void test_control_deadline_and_purge_count_window_once() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  // Make the deliberate purge-trigger step a quiet completed window, so
+  // counting it twice would prematurely satisfy the two-window condition.
+  fixture.state.setpoints.drynessSlopeGm3PerHour = 10.0f;
+  fixture.start();
+  fixture.flat(31000, 181000);
+  fixture.state.air.absoluteHumidityGm3 = 0.6f;
+  fixture.control.update(fixture.state, 211000);
+  TEST_ASSERT_EQUAL_UINT8(2, fixture.state.purgePhase);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  fixture.control.update(fixture.state, 211001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+}
+
+void test_control_partial_window_is_not_carried_through_purge() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 30;
+  fixture.start();
+  fixture.control.update(fixture.state, 31000);
+  fixture.state.air.absoluteHumidityGm3 = 6.0f;
+  fixture.control.update(fixture.state, 61000);
+  TEST_ASSERT_EQUAL_UINT8(2, fixture.state.purgePhase);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.ahSlopeSamples);
+  fixture.state.air.absoluteHumidityGm3 = 0.1f;
+  fixture.control.update(fixture.state, 62000);
+  fixture.control.update(fixture.state, 242000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.ahSlopeSamples);
+  fixture.flat(272000, 422000);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+  fixture.control.update(fixture.state, 452000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+}
+
+void test_control_paused_hold_requires_a_new_quiet_window() {
+  ControlFixture fixture;
+  fixture.state.setpoints.maxDurationSeconds = 10;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.start();
+  fixture.control.update(fixture.state, 11000);
+  fixture.flat(41000, 221000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  fixture.machine.pause(fixture.state, 222000);
+  fixture.control.update(fixture.state, 222000);
+  fixture.machine.resume(fixture.state, 223000);
+  fixture.control.update(fixture.state, 223000);
+  for (uint32_t now = 253000; now <= 433000; now += 30000) {
+    fixture.state.air.absoluteHumidityGm3 += 0.003f;
+    fixture.control.update(fixture.state, now);
+  }
+  fixture.control.update(fixture.state, 433001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_FALSE(fixture.state.rewetDetected);
+}
+
+void test_state_machine_zero_threshold_ignores_stale_dryness_events() {
+  ControlFixture fixture;
+  fixture.state.setpoints.maxDurationSeconds = 10;
+  fixture.state.setpoints.drynessSlopeGm3PerHour = 0.0f;
+  fixture.start();
+  fixture.state.drynessChecks = 255;
+  fixture.machine.update(fixture.state, 2000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+  fixture.machine.update(fixture.state, 11000);
+  fixture.state.rewetDetected = true;
+  fixture.machine.update(fixture.state, 12000);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_FALSE(fixture.state.rewetDetected);
+}
+
+void test_control_pause_between_ticks_discards_partial_window() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.start();
+  fixture.flat(31000, 181000);
+  TEST_ASSERT_EQUAL_UINT8(7, fixture.state.ahSlopeSamples);
+  fixture.machine.pause(fixture.state, 181010);
+  fixture.machine.resume(fixture.state, 181020);
+  fixture.control.update(fixture.state, 181030);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.ahSlopeSamples);
+  fixture.control.update(fixture.state, 211030);
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+}
+
+void test_control_pause_between_ticks_clears_hold_arming() {
+  ControlFixture fixture;
+  fixture.state.setpoints.maxDurationSeconds = 10;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.start();
+  fixture.control.update(fixture.state, 11000);
+  fixture.flat(41000, 221000);
+  TEST_ASSERT_EQUAL_UINT8(1, fixture.state.drynessChecks);
+  // Equal command timestamps must still invalidate the old Hold baseline.
+  fixture.machine.pause(fixture.state, 222000);
+  fixture.machine.resume(fixture.state, 222000);
+  fixture.control.update(fixture.state, 222000);
+  for (uint32_t now = 253000; now <= 433000; now += 30000) {
+    fixture.state.air.absoluteHumidityGm3 += 0.003f;
+    fixture.control.update(fixture.state, now);
+  }
+  fixture.control.update(fixture.state, 433001);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Hold),
+                    static_cast<int>(fixture.state.phase));
+}
+
+void test_control_resume_clears_verdict_before_state_machine_update() {
+  ControlFixture fixture;
+  fixture.state.setpoints.ventilation.minSealSeconds = 210;
+  fixture.start();
+  fixture.flat(31000, 421000);
+  TEST_ASSERT_EQUAL_UINT8(2, fixture.state.drynessChecks);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+  fixture.machine.pause(fixture.state, 421010);
+  fixture.machine.resume(fixture.state, 421020);
+  fixture.control.update(fixture.state, 421030);
+  TEST_ASSERT_EQUAL(static_cast<int>(DryingPhase::Drying),
+                    static_cast<int>(fixture.state.phase));
+  TEST_ASSERT_EQUAL_UINT8(0, fixture.state.drynessChecks);
+}
+
+int runTests() {
   UNITY_BEGIN();
   RUN_TEST(test_absolute_humidity_round_trip);
   RUN_TEST(test_pid_output_is_bounded_and_rate_limited);
@@ -448,7 +842,25 @@ void runTests() {
   RUN_TEST(test_state_machine_preset_dry_then_hold);
   RUN_TEST(test_state_machine_manual_stops_at_duration);
   RUN_TEST(test_control_dryness_streak_from_sealed_windows);
-  UNITY_END();
+  RUN_TEST(test_control_flat_ah_completes_without_extra_purges);
+  RUN_TEST(test_control_short_plan_still_requires_eight_samples);
+  RUN_TEST(test_control_warmup_does_not_count_dry_windows);
+  RUN_TEST(test_control_temperature_gap_discards_partial_window);
+  RUN_TEST(test_control_resume_starts_fresh_measurement_window);
+  RUN_TEST(test_control_new_run_during_drying_resets_windows);
+  RUN_TEST(test_control_initial_purge_and_settle_do_not_count_samples);
+  RUN_TEST(test_control_time_ceiling_keeps_hold_with_zero_streak);
+  RUN_TEST(test_control_hold_requires_quiet_then_new_wet_window);
+  RUN_TEST(test_control_zero_threshold_disables_dryness_and_redry);
+  RUN_TEST(test_control_hold_cooling_does_not_arm_rewetting);
+  RUN_TEST(test_control_deadline_and_purge_count_window_once);
+  RUN_TEST(test_control_partial_window_is_not_carried_through_purge);
+  RUN_TEST(test_control_paused_hold_requires_a_new_quiet_window);
+  RUN_TEST(test_state_machine_zero_threshold_ignores_stale_dryness_events);
+  RUN_TEST(test_control_pause_between_ticks_discards_partial_window);
+  RUN_TEST(test_control_pause_between_ticks_clears_hold_arming);
+  RUN_TEST(test_control_resume_clears_verdict_before_state_machine_update);
+  return UNITY_END();
 }
 
 #ifdef ARDUINO
@@ -460,7 +872,6 @@ void setup() {
 void loop() {}
 #else
 int main(int argc, char** argv) {
-  runTests();
-  return 0;
+  return runTests();
 }
 #endif
