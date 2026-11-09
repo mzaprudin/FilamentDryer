@@ -4,6 +4,8 @@
 
 [Русская версия](README.RU.md)
 
+**Status: Breadboard prototype tested, PCB routed (ready for fabrication)**
+
 Firmware for an ESP32 dryer with two filament spools. It heats the chamber,
 estimates moisture release from the air, and moves to a lower storage temperature
 when the preset's drying criterion or maximum time is reached. During storage it
@@ -42,6 +44,14 @@ flowchart TD
 Hardware: ESP32-WROOM-32D, AHT30 air sensor, heater NTC thermistor, two HX711 load
 cells, a 24 V PTC heater, fans and a servo vent. Weight readings support spool
 monitoring; the moisture estimate uses the air sensor.
+
+## PCB
+
+![FilamentDryer PCB 3D model](docs/assets/pcb-3d.png)
+
+| Top | Bottom |
+|---|---|
+| [![PCB top layout](docs/assets/pcb-top.svg)](docs/assets/pcb-top.svg) | [![PCB bottom layout](docs/assets/pcb-bottom.svg)](docs/assets/pcb-bottom.svg) |
 
 ## Build and run
 
